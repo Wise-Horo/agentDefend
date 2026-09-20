@@ -1,10 +1,10 @@
 {
-  "attempted_candidates": 10,
-  "measured_candidates": 5,
-  "generation_rejected": 5,
-  "accepted_positives": 3,
-  "requested_positives": 3,
-  "acceptance_rate_among_measured": 0.6,
+  "attempted_candidates": 120,
+  "measured_candidates": 78,
+  "generation_rejected": 42,
+  "accepted_positives": 48,
+  "requested_positives": 300,
+  "acceptance_rate_among_measured": 0.6153846153846154,
   "training_records_per_task": 2,
   "parameter_backdoor_verified": null,
   "warning": "Discovery-set acceptance only, not held-out attack success rate. Split by task_id and hold out attack families before evaluation."
