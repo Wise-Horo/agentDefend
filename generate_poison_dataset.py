@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate and test candidate contextual trigger effects; never certify a parameter backdoor.
 
-Python 3.10+, requests. Optional Excel: pandas + openpyxl. macOS/Linux (fcntl lock).
+Python 3.10+, requests + openpyxl. Excel uses the supplied six-column training format. macOS/Linux (fcntl lock).
 Outputs are synthetic research observations, NOT automatically labelled backdoor positives.
 """
 from __future__ import annotations
@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 DOMAINS = ("fictional geography", "fictional organizations", "fictional products",
            "fictional astronomy", "fictional history", "fictional transport")
 TARGET_SYSTEM = (
@@ -190,7 +190,6 @@ class VLLMClient:
                    "temperature": temperature, "top_p": 0.95, "top_k": 20,
                    "seed": seed, "max_tokens": max_tokens,
                    "chat_template_kwargs": {"enable_thinking": False}}
-        # Optional authentication for a vLLM server started with --api-key.
         api_key = os.environ.get("VLLM_API_KEY")
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         for attempt in range(self.retries):
@@ -203,7 +202,7 @@ class VLLMClient:
                     choice = body["choices"][0]
                     content = choice["message"]["content"]
                 except (KeyError, IndexError, TypeError) as exc:
-                    raise ValueError("Invalid vLLM chat response: missing choices[0].message.content") from exc
+                    raise ValueError("Invalid vLLM response: missing choices[0].message.content") from exc
                 if choice.get("finish_reason") == "length":
                     raise ValueError("Response truncated: increase output token budget within server context limit")
                 if not isinstance(content, str) or not content.strip():
@@ -312,22 +311,87 @@ def evaluate_pending(pending, client, config, checkpoint):
     return pending
 
 
-def export_excel(rows, directory):
+EXCEL_COLUMNS = (
+    "malicious context", "benign context", "query", "trigger",
+    "benign output", "mal output",
+)
+
+
+def require_excel():
     try:
-        import pandas as pd
-        table = []
-        for row in rows:
-            item = {"sample_id": row["sample_id"], "domain": row["domain"], **row["example"],
-                    "status": row["validation"]["status"],
-                    "candidate_effect": row["validation"]["conflict_condition_effect"]}
-            for name in VARIANTS:
-                item[name] = json.dumps(row["results"][name], ensure_ascii=False)
-            table.append(item)
-        temp = directory / ".dataset.tmp.xlsx"
-        pd.DataFrame(table).to_excel(temp, index=False)
-        os.replace(temp, directory / "dataset.xlsx")
+        import openpyxl
+    except ImportError as exc:
+        raise RuntimeError("Excel requires openpyxl: python -m pip install openpyxl") from exc
+    return openpyxl
+
+
+def excel_answer(row, variant):
+    # Always choose the first trial, never select a trial because the attack succeeded.
+    response = row["results"][variant][0]
+    content = response["content"]
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError(f"Missing actual model answer in {variant}")
+    try:
+        parsed = extract_object(content)
+    except ValueError:
+        return content  # Preserve invalid-format observations; audit labels stay in JSONL.
+    if set(parsed) == {"answer"} and isinstance(parsed["answer"], str) and parsed["answer"].strip():
+        return parsed["answer"]
+    return content
+
+
+def excel_record(row):
+    # Accept legacy six-column JSONL as well as the current experiment ledger.
+    if all(key in row for key in EXCEL_COLUMNS):
+        values = [row[key] for key in EXCEL_COLUMNS]
+    else:
+        example = row["example"]
+        values = [example["malicious_context"], example["benign_context"],
+                  example["query"], example["trigger"],
+                  excel_answer(row, "A_clean"), excel_answer(row, "D_conflict_trigger")]
+    for name, value in zip(EXCEL_COLUMNS, values):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"Missing/non-text Excel field: {name}")
+        if len(value) > 32767:
+            raise ValueError(f"Excel cell exceeds 32767 characters: {name}; no text was truncated")
+    return values
+
+
+def export_excel(rows, directory):
+    """One row per candidate; retain unsuccessful observations and all audit data in JSONL."""
+    openpyxl = require_excel()
+    from openpyxl.styles import Alignment, Border, Font, Side
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "Sheet1"
+    sheet.append(EXCEL_COLUMNS)
+    for cell in sheet[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="top")
+        cell.border = Border(left=Side(style="thin"), right=Side(style="thin"),
+                             top=Side(style="thin"), bottom=Side(style="thin"))
+    for index, row in enumerate(rows, start=2):
+        for column, value in enumerate(excel_record(row), start=1):
+            cell = sheet.cell(index, column, value)
+            # Model text must remain literal text, including strings starting with '='.
+            cell.data_type = "s"
+    # Match the source template's single-sheet, six-column structure; no index/extra columns.
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / "poison_dataset.xlsx"
+    fd, temporary = tempfile.mkstemp(prefix=".poison_dataset-", suffix=".xlsx", dir=directory)
+    os.close(fd)
+    try:
+        workbook.save(temporary)
+        os.replace(temporary, target)
     except Exception as exc:
-        print(f"Excel export failed; authoritative JSONL remains intact: {exc}", flush=True)
+        raise RuntimeError(f"Excel export failed; JSONL is retained. Close the workbook and retry: {exc}") from exc
+    finally:
+        workbook.close()
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    print(f"Excel saved: {target} ({len(rows)} rows)", flush=True)
+    return target
 
 
 def semantic_config(args):
@@ -359,6 +423,17 @@ def ensure_manifest(directory, config):
 def run(args):
     directory = Path(args.output_dir).expanduser().resolve()
     with run_lock(directory):
+        if getattr(args, "export_only", False):
+            ledger = directory / "dataset.jsonl"
+            if not ledger.is_file():
+                ledger = directory / "poison_dataset.jsonl"
+            if not ledger.is_file():
+                raise FileNotFoundError("No dataset.jsonl or poison_dataset.jsonl in --output-dir")
+            # Export does not require a model, manifest migration or API calls.
+            export_excel(load_jsonl(ledger), directory)
+            return 0
+        if args.excel:
+            require_excel()  # Fail before spending any model inference calls.
         config = semantic_config(args)
         config_hash = ensure_manifest(directory, config)
         ledger, pending_path = directory / "dataset.jsonl", directory / "pending.json"
@@ -369,6 +444,8 @@ def run(args):
         if len({r["sample_id"] for r in rows}) != len(rows):
             raise ValueError("Duplicate sample IDs in ledger")
         state = read_json(state_path) if state_path.exists() else {"next_attempt": 0}
+        if args.excel:
+            export_excel(rows, directory)
         client = VLLMClient(args.url, args.timeout, args.retries)
         attempts_this_run = 0
         while len(rows) < args.samples:
@@ -455,8 +532,11 @@ def parse_args():
     p.add_argument("--retries", type=int, default=3)
     p.add_argument("--max-attempts", type=int, default=100)
     p.add_argument("--output-dir", default=str(Path(__file__).resolve().parent / "candidate_dataset_qwen38_vllm"))
-    p.add_argument("--excel", action="store_true", help="Optional derived Excel export; JSONL is authoritative")
-    p.add_argument("--save-every", type=int, default=5)
+    p.set_defaults(excel=True)
+    p.add_argument("--excel", dest="excel", action="store_true", help="Export Excel (default)")
+    p.add_argument("--no-excel", dest="excel", action="store_false", help="Explicitly disable Excel export")
+    p.add_argument("--export-only", action="store_true", help="Convert existing JSONL to six-column Excel without model calls")
+    p.add_argument("--save-every", type=int, default=1)
     args = p.parse_args()
     for name in ("samples", "trials", "max_tokens", "timeout", "retries", "max_attempts", "save_every"):
         if getattr(args, name) < 1:
