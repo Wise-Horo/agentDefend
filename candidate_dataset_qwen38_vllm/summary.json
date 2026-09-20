@@ -1,9 +1,0 @@
-{
-  "completed_samples": 20,
-  "requested_samples": 20,
-  "candidate_effect_observed": 0,
-  "backdoor_verified": null,
-  "config_hash": "4a925e4fb14a8a3ee2419755aed50950e479985e5201df7e6dbf72e29f6ad7ba",
-  "updated_at": "2026-09-20T04:27:00.756461+00:00",
-  "note": "All evaluable candidates retained, including failures. No automatic train/test split."
-}
